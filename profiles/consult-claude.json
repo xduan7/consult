@@ -1,0 +1,23 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "consult-claude",
+    "version": "0.1.0",
+    "description": "consult: run Claude Code with the project directory read-only"
+  },
+  "groups": {
+    "include": [
+      { "name": "claude_code_macos", "when": "macos" },
+      { "name": "user_caches_macos", "when": "macos" },
+      "node_runtime",
+      "rust_runtime",
+      "python_runtime",
+      "git_config"
+    ]
+  },
+  "filesystem": {
+    "allow": ["$HOME/.claude"]
+  },
+  "network": { "block": false },
+  "workdir": { "access": "read" }
+}

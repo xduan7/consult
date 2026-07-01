@@ -1,0 +1,23 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "consult-codex",
+    "version": "0.1.0",
+    "description": "consult: run Codex with the project directory read-only"
+  },
+  "groups": {
+    "include": [
+      { "name": "codex_macos", "when": "macos" },
+      { "name": "user_caches_macos", "when": "macos" },
+      "node_runtime",
+      "rust_runtime",
+      "python_runtime",
+      "git_config"
+    ]
+  },
+  "filesystem": {
+    "allow": ["$HOME/.codex"]
+  },
+  "network": { "block": false },
+  "workdir": { "access": "read" }
+}

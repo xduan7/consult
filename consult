@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""consult — run an AI agent CLI (codex/claude) sandboxed by nono.
+
+Guarantees, enforced by nono at the OS level (not by trusting the agent):
+  - the directory you run it in is READ-ONLY (the agent cannot change your files)
+  - the network and all the agent's own abilities stay ON
+
+Usage — the rule is: dash means raw, word means prompt.
+  consult <agent> "prompt or prompt-file" [output-file]
+      Simple mode, identical shape for both agents. The prompt is a literal
+      string, or a path to a file holding it. The final answer goes to the
+      terminal, or to output-file if given (must be OUTSIDE this directory —
+      the sandbox makes this directory read-only).
+  consult <agent> -<flag> [args...]   raw mode: a leading '-' passes ALL args
+                                      through to the agent untouched
+  consult <agent> -- <args...>        raw mode, explicit — for bare words,
+                                      e.g. consult codex -- exec "..."
+  consult <agent>                     interactive session, sandboxed
+  consult --help                      this help
+
+Examples:
+  consult codex  "review the auth flow"
+  consult claude "review the auth flow"        # same shape, same behavior
+  consult codex  ./prompt.md /tmp/answer.txt
+  consult codex  --help                        # codex's own help
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+AGENTS = ("codex", "claude")
+
+# codex wraps its commands in its own macOS sandbox, which cannot nest inside
+# nono's; this tells codex not to, leaving nono as the single enforcing sandbox.
+INJECT = {
+    "codex": ["-c", 'sandbox_mode="danger-full-access"'],
+    "claude": [],
+}
+
+# Simple-mode plumbing: one-shot, prompt on stdin, identical for both agents.
+SIMPLE = {
+    "codex": ["exec", "--skip-git-repo-check"],
+    "claude": ["-p", "--strict-mcp-config"],
+}
+
+HERE = Path(__file__).resolve().parent  # resolve() so a symlink install finds profiles/
+
+
+def die(msg, code=2):
+    print(f"consult: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def selftest(profile):
+    """Run a throwaway write probe in the current directory under the sandbox.
+    Returns (ok, why): ok only if the sandbox applied and denied the write."""
+    script = (
+        "p=.consult_selftest_$$; "
+        'if (: > "$p") 2>/dev/null; then rm -f "$p" 2>/dev/null; echo WRITABLE; '
+        "else echo READONLY; fi"
+    )
+    cmd = ["nono", "run", "-s", "--profile", str(profile), "--allow-cwd",
+           "--", "sh", "-c", script]
+    try:
+        probe = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "sandbox self-test timed out after 60s"
+    except Exception as e:
+        return False, f"sandbox self-test could not run: {e}"
+    if "WRITABLE" in probe.stdout:
+        return False, ("this directory is writable inside the sandbox — your project "
+                       "is in a writable location like /tmp or a cache dir")
+    if probe.returncode == 0 and "READONLY" in probe.stdout:
+        return True, ""
+    err = (probe.stderr or probe.stdout).strip() or f"nono exited {probe.returncode}"
+    return False, f"the sandbox did not start: {err}"
+
+
+def wire_simple(agent, positionals):
+    """Simple mode: <prompt-or-file> [output-file]. Returns the agent's argv
+    tail; wires stdin (and stdout, for claude's output file) to survive execvp."""
+    if len(positionals) > 2:
+        die("simple mode takes at most two arguments: <prompt-or-file> [output-file]. "
+            "For raw agent arguments use: consult <agent> -- <args...>")
+    prompt = positionals[0]
+    outfile = positionals[1] if len(positionals) == 2 else None
+    if not prompt:
+        die("empty prompt.")
+
+    if Path(prompt).is_file():
+        fd = os.open(prompt, os.O_RDONLY)
+    else:
+        tmp = tempfile.TemporaryFile()
+        tmp.write(prompt.encode())
+        tmp.flush()
+        tmp.seek(0)
+        fd = tmp.fileno()
+    os.dup2(fd, 0)
+
+    args = list(SIMPLE[agent])
+    if outfile:
+        out = Path(outfile).resolve()
+        if out.is_relative_to(Path.cwd()):
+            die("output file must be OUTSIDE this directory — the sandbox makes "
+                "it read-only. Use /tmp or another writable location.")
+        if agent == "codex":
+            args += ["-o", str(out)]
+        else:
+            os.dup2(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644), 1)
+    if agent == "codex":
+        args.append("-")  # '-' = read the prompt from stdin
+    return args
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+
+    agent, rest = args[0], args[1:]
+    if agent not in AGENTS:
+        die(f"unknown agent '{agent}'. Supported: {', '.join(AGENTS)}.")
+    if shutil.which("nono") is None:
+        die("nono is not installed / not on PATH; refusing to run the agent "
+            "unsandboxed. Install nono first.", code=3)
+    if shutil.which(agent) is None:
+        die(f"'{agent}' is not installed / not on PATH.", code=6)
+
+    profile = HERE / "profiles" / f"consult-{agent}.json"
+    if not profile.is_file():
+        die(f"profile not found: {profile}", code=5)
+
+    # Dash means raw, word means prompt.
+    if not rest:
+        agent_args = []  # interactive session
+    elif rest[0] == "--":
+        agent_args = rest[1:]
+    elif rest[0].startswith("-"):
+        agent_args = rest
+    else:
+        agent_args = wire_simple(agent, rest)
+
+    ok, why = selftest(profile)
+    if not ok:
+        die(f"refusing to run — {why}.", code=4)
+
+    os.execvp("nono", ["nono", "run", "-s", "--profile", str(profile),
+                       "--allow-cwd", "--", agent, *INJECT[agent], *agent_args])
+
+
+if __name__ == "__main__":
+    main()
