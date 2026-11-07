@@ -31,6 +31,13 @@ consult claude "review the auth flow"        # identical
 consult codex  ./prompt.md /tmp/answer.txt   # prompt from file, answer -> file
 consult claude ./prompt.md /tmp/answer.txt   # identical
 
+# Sessions — an optional third path carries the conversation across runs.
+# Absent or empty: a new session starts and its id is saved into the file.
+# Holding an id: that session is resumed, memory intact.
+consult codex  ./q1.md /tmp/a1.txt /tmp/r.session
+consult codex  ./q2.md /tmp/a2.txt /tmp/r.session   # remembers q1
+consult claude ./q1.md -          /tmp/r.session    # '-' = answer on terminal
+
 # Raw mode — a leading '-' passes everything through to the agent untouched.
 consult codex  --help                        # codex's own help
 consult claude --model opus -p "..."
@@ -45,8 +52,9 @@ consult --help                               # this tool's help
 In simple mode the plumbing is applied for you (`codex exec
 --skip-git-repo-check` reading stdin / `claude -p --strict-mcp-config`), so
 both agents take the exact same command shape: prompt in, answer out. The
-optional output file receives the agent's **final answer** and must live
-*outside* the protected directory (it's read-only — consult refuses
+optional output file receives the agent's **final answer**; the optional
+session file lets you continue a conversation later with either agent. Both
+must live *outside* the protected directory (it's read-only — consult refuses
 otherwise). Note codex won't insist on a git repo in simple mode.
 
 ## What it guarantees

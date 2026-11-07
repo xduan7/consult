@@ -6,11 +6,14 @@ Guarantees, enforced by nono at the OS level (not by trusting the agent):
   - the network and all the agent's own abilities stay ON
 
 Usage — the rule is: dash means raw, word means prompt.
-  consult <agent> "prompt or prompt-file" [output-file]
+  consult <agent> "prompt or prompt-file" [output-file] [session-file]
       Simple mode, identical shape for both agents. The prompt is a literal
       string, or a path to a file holding it. The final answer goes to the
-      terminal, or to output-file if given (must be OUTSIDE this directory —
-      the sandbox makes this directory read-only).
+      terminal, or to output-file if given ('-' keeps it on the terminal).
+      The session file carries the conversation: absent or empty, a new
+      session starts and its id is saved there; holding an id, that session
+      is resumed. Both files must be OUTSIDE this directory — the sandbox
+      makes this directory read-only.
   consult <agent> -<flag> [args...]   raw mode: a leading '-' passes ALL args
                                       through to the agent untouched
   consult <agent> -- <args...>        raw mode, explicit — for bare words,
@@ -20,32 +23,52 @@ Usage — the rule is: dash means raw, word means prompt.
 
 Examples:
   consult codex  "review the auth flow"
-  consult claude "review the auth flow"        # same shape, same behavior
-  consult codex  ./prompt.md /tmp/answer.txt
-  consult codex  --help                        # codex's own help
+  consult claude "review the auth flow"                # same shape, same behavior
+  consult codex  ./q1.md /tmp/a1.txt /tmp/r.session    # starts a session
+  consult codex  ./q2.md /tmp/a2.txt /tmp/r.session    # resumes it
+  consult codex  --help                                # codex's own help
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
-AGENTS = ("codex", "claude")
-
-# codex wraps its commands in its own macOS sandbox, which cannot nest inside
-# nono's; this tells codex not to, leaving nono as the single enforcing sandbox.
-INJECT = {
-    "codex": ["-c", 'sandbox_mode="danger-full-access"'],
-    "claude": [],
+# Everything agent-specific lives in this table; the rest of the script is
+# mechanism. Keys:
+#   inject   always placed right after the agent name (codex: forgo its own
+#            macOS sandbox — it cannot nest inside nono's, which stays the
+#            single enforcing sandbox)
+#   oneshot  simple mode, new conversation
+#   assign   simple mode, new conversation recorded under a chosen {id}
+#            (None: the agent picks its own id — capture it from its output)
+#   resume   simple mode, continue conversation {id}
+#   output   route the final answer to {out} (None: redirect stdout instead)
+#   stdin    trailing args that make the agent read the prompt from stdin
+AGENT = {
+    "codex": {
+        "inject":  ["-c", 'sandbox_mode="danger-full-access"'],
+        "oneshot": ["exec", "--skip-git-repo-check"],
+        "assign":  None,
+        "resume":  ["exec", "resume", "--skip-git-repo-check", "{id}"],
+        "output":  ["-o", "{out}"],
+        "stdin":   ["-"],
+    },
+    "claude": {
+        "inject":  [],
+        "oneshot": ["-p", "--strict-mcp-config"],
+        "assign":  ["-p", "--strict-mcp-config", "--session-id", "{id}"],
+        "resume":  ["-p", "--strict-mcp-config", "--resume", "{id}"],
+        "output":  None,
+        "stdin":   [],
+    },
 }
 
-# Simple-mode plumbing: one-shot, prompt on stdin, identical for both agents.
-SIMPLE = {
-    "codex": ["exec", "--skip-git-repo-check"],
-    "claude": ["-p", "--strict-mcp-config"],
-}
+SESSION_ID = re.compile(r"session id:\s*(\S+)", re.IGNORECASE)
 
 HERE = Path(__file__).resolve().parent  # resolve() so a symlink install finds profiles/
 
@@ -80,14 +103,28 @@ def selftest(profile):
     return False, f"the sandbox did not start: {err}"
 
 
+def writable_path_or_die(path_arg, what):
+    path = Path(path_arg).resolve()
+    if path.is_relative_to(Path.cwd()):
+        die(f"{what} must be OUTSIDE this directory — the sandbox makes it "
+            "read-only. Use /tmp or another writable location.")
+    return path
+
+
 def wire_simple(agent, positionals):
-    """Simple mode: <prompt-or-file> [output-file]. Returns the agent's argv
-    tail; wires stdin (and stdout, for claude's output file) to survive execvp."""
-    if len(positionals) > 2:
-        die("simple mode takes at most two arguments: <prompt-or-file> [output-file]. "
+    """Simple mode: <prompt-or-file> [output-file] [session-file].
+    Returns (args, session): the agent's argv tail plus the session action —
+    ("write", path, id) to record a pre-chosen id, ("capture", path) to
+    harvest the agent's own id from its output, or None. Wires stdin (and
+    stdout, when the answer is routed by redirect) to survive execvp."""
+    spec = AGENT[agent]
+    if len(positionals) > 3:
+        die("simple mode takes at most three arguments: "
+            "<prompt-or-file> [output-file] [session-file]. "
             "For raw agent arguments use: consult <agent> -- <args...>")
-    prompt = positionals[0]
-    outfile = positionals[1] if len(positionals) == 2 else None
+    prompt, outfile, sessionfile = (positionals + [None, None])[:3]
+    if outfile == "-":
+        outfile = None
     if not prompt:
         die("empty prompt.")
 
@@ -101,19 +138,45 @@ def wire_simple(agent, positionals):
         fd = tmp.fileno()
     os.dup2(fd, 0)
 
-    args = list(SIMPLE[agent])
+    mode, session_id, session = "oneshot", "", None
+    if sessionfile:
+        spath = writable_path_or_die(sessionfile, "session file")
+        session_id = spath.read_text().strip() if spath.is_file() else ""
+        if session_id:
+            mode = "resume"
+        elif spec["assign"]:
+            mode, session_id = "assign", str(uuid.uuid4())
+            session = ("write", spath, session_id)
+        else:
+            session = ("capture", spath)
+
+    args = [part.replace("{id}", session_id) for part in spec[mode]]
     if outfile:
-        out = Path(outfile).resolve()
-        if out.is_relative_to(Path.cwd()):
-            die("output file must be OUTSIDE this directory — the sandbox makes "
-                "it read-only. Use /tmp or another writable location.")
-        if agent == "codex":
-            args += ["-o", str(out)]
+        out = writable_path_or_die(outfile, "output file")
+        if spec["output"]:
+            args += [part.replace("{out}", str(out)) for part in spec["output"]]
         else:
             os.dup2(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644), 1)
-    if agent == "codex":
-        args.append("-")  # '-' = read the prompt from stdin
-    return args
+    return args + spec["stdin"], session
+
+
+def run_capturing_session(cmd, spath):
+    """Stay attached instead of execvp: codex announces the session id in its
+    progress stream (stderr), so relay that stream and save the id."""
+    child = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+    found = None
+    for line in child.stderr:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        found = found or SESSION_ID.search(line)
+    code = child.wait()
+    if found is None:
+        die("the agent reported no session id; session file not written.", code=7)
+    try:
+        spath.write_text(found.group(1) + "\n")
+    except OSError as e:
+        die(f"cannot write session file: {e}", code=7)
+    sys.exit(code)
 
 
 def main():
@@ -123,8 +186,8 @@ def main():
         sys.exit(0)
 
     agent, rest = args[0], args[1:]
-    if agent not in AGENTS:
-        die(f"unknown agent '{agent}'. Supported: {', '.join(AGENTS)}.")
+    if agent not in AGENT:
+        die(f"unknown agent '{agent}'. Supported: {', '.join(AGENT)}.")
     if shutil.which("nono") is None:
         die("nono is not installed / not on PATH; refusing to run the agent "
             "unsandboxed. Install nono first.", code=3)
@@ -136,6 +199,7 @@ def main():
         die(f"profile not found: {profile}", code=5)
 
     # Dash means raw, word means prompt.
+    session = None
     if not rest:
         agent_args = []  # interactive session
     elif rest[0] == "--":
@@ -143,14 +207,23 @@ def main():
     elif rest[0].startswith("-"):
         agent_args = rest
     else:
-        agent_args = wire_simple(agent, rest)
+        agent_args, session = wire_simple(agent, rest)
 
     ok, why = selftest(profile)
     if not ok:
         die(f"refusing to run — {why}.", code=4)
 
-    os.execvp("nono", ["nono", "run", "-s", "--profile", str(profile),
-                       "--allow-cwd", "--", agent, *INJECT[agent], *agent_args])
+    cmd = ["nono", "run", "-s", "--profile", str(profile), "--allow-cwd",
+           "--", agent, *AGENT[agent]["inject"], *agent_args]
+    if session:
+        action, spath = session[0], session[1]
+        if action == "capture":
+            run_capturing_session(cmd, spath)
+        try:
+            spath.write_text(session[2] + "\n")
+        except OSError as e:
+            die(f"cannot write session file: {e}", code=7)
+    os.execvp(cmd[0], cmd)
 
 
 if __name__ == "__main__":
