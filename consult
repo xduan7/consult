@@ -60,9 +60,13 @@ AGENT = {
     },
     "claude": {
         "inject":  [],
-        "oneshot": ["-p", "--strict-mcp-config"],
-        "assign":  ["-p", "--strict-mcp-config", "--session-id", "{id}"],
-        "resume":  ["-p", "--strict-mcp-config", "--resume", "{id}"],
+        # -p cannot ask for approval, so it denies any tool not allowed up
+        # front: pre-allow the web tools (other approval-gated tools stay denied)
+        "oneshot": ["-p", "--strict-mcp-config", "--allowedTools=WebFetch,WebSearch"],
+        "assign":  ["-p", "--strict-mcp-config", "--allowedTools=WebFetch,WebSearch",
+                    "--session-id", "{id}"],
+        "resume":  ["-p", "--strict-mcp-config", "--allowedTools=WebFetch,WebSearch",
+                    "--resume", "{id}"],
         "output":  None,
         "stdin":   [],
     },

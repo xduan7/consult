@@ -50,12 +50,20 @@ consult --help                               # this tool's help
 ```
 
 In simple mode the plumbing is applied for you (`codex exec
---skip-git-repo-check` reading stdin / `claude -p --strict-mcp-config`), so
-both agents take the exact same command shape: prompt in, answer out. The
-optional output file receives the agent's **final answer**; the optional
-session file lets you continue a conversation later with either agent. Both
-must live *outside* the protected directory (it's read-only — consult refuses
-otherwise). Note codex won't insist on a git repo in simple mode.
+--skip-git-repo-check` reading stdin / `claude -p --strict-mcp-config
+--allowedTools=WebFetch,WebSearch`), so both agents take the exact same
+command shape: prompt in, answer out. The optional output file receives the
+agent's **final answer**; the optional session file lets you continue a
+conversation later with either agent. Both must live *outside* the protected
+directory (it's read-only — consult refuses otherwise). Note codex won't
+insist on a git repo in simple mode.
+
+`claude -p` can't ask you to approve a tool, so it denies every tool that needs
+approval unless it was allowed up front. consult pre-allows claude's web tools
+(`WebFetch`, `WebSearch`) so it can reach the internet like codex. Anything else
+that needs approval — e.g. a shell command like `curl` — is still denied in
+simple mode; use interactive mode, or pass your own permission flags in raw
+mode.
 
 ## What it guarantees
 
@@ -93,7 +101,8 @@ Linux group variants and testing before it's supported.
 ```sh
 nono run -s --profile profiles/consult-codex.json --allow-cwd \
   -- codex -c sandbox_mode="danger-full-access" exec --skip-git-repo-check -
-# with the prompt fed on stdin; claude expands to: claude -p --strict-mcp-config
+# with the prompt fed on stdin; claude expands to:
+#   claude -p --strict-mcp-config --allowedTools=WebFetch,WebSearch
 ```
 
 The profile (`profiles/consult-<agent>.json`) is the permission list nono
